@@ -3,9 +3,9 @@
 A library for Node.js to generate offline search data for use in a public transport app.
 
 [![NPM version](https://img.shields.io/npm/v/osm-search-data-export.svg?style=flat)](https://www.npmjs.com/package/osm-search-data-export)
-[![GitHub release](https://img.shields.io/github/release/trufi-app/osm-search-data-export.svg)](https://github.com/trufi-app/osm-search-data-export/releases/)
-[![Package dependencies](https://img.shields.io/david/trufi-app/osm-search-data-export.svg)](https://david-dm.org/trufi-app/osm-search-data-export)
-[![GitHub license](https://img.shields.io/github/license/trufi-app/osm-search-data-export.svg)](https://github.com/trufi-app/osm-search-data-export/blob/master/LICENSE)
+[![GitHub release](https://img.shields.io/github/release/trufi-association/osm-search-data-export.svg)](https://github.com/trufi-association/osm-search-data-export/releases/)
+[![Package dependencies](https://img.shields.io/david/trufi-association/osm-search-data-export.svg)](https://david-dm.org/trufi-association/osm-search-data-export)
+[![GitHub license](https://img.shields.io/github/license/trufi-association/osm-search-data-export.svg)](https://github.com/trufi-association/osm-search-data-export/blob/master/LICENSE)
 
 ## Motivation
 
