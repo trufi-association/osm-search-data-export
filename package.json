@@ -1,0 +1,32 @@
+{
+  "name": "osm-search-data-export",
+  "version": "1.0.0",
+  "description": "",
+  "main": "index.js",
+  "bin": "cli.js",
+  "scripts": {
+    "test": "echo \"Error: no test specified\" && exit 1"
+  },
+  "author": "Malte Dölker <mdoelker@me.com>",
+  "license": "MIT",
+  "dependencies": {
+    "@derhuerst/query-overpass": "^1.0.1",
+    "@turf/along": "^6.0.1",
+    "@turf/boolean-point-in-polygon": "^6.0.1",
+    "@turf/center-of-mass": "^6.0.1",
+    "@turf/concave": "^6.0.5",
+    "@turf/distance": "^6.0.1",
+    "@turf/helpers": "^6.1.4",
+    "@turf/length": "^6.0.2",
+    "better-sqlite3": "^5.4.0",
+    "commander": "^3.0.2",
+    "debug": "^4.1.1",
+    "lodash.without": "^4.4.0",
+    "osm-pbf-parser": "^2.3.0",
+    "through2": "^3.0.1"
+  },
+  "devDependencies": {
+    "babel-eslint": "^10.0.3",
+    "eslint": "^6.5.1"
+  }
+}
