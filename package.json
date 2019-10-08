@@ -9,6 +9,9 @@
   },
   "author": "Malte Dölker <mdoelker@me.com>",
   "license": "MIT",
+  "engines" : {
+    "node" : ">=11.0.0"
+  },
   "dependencies": {
     "@derhuerst/query-overpass": "^1.0.1",
     "@turf/along": "^6.0.1",
