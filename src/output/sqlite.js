@@ -1,10 +1,11 @@
 const debug = require('debug')('osm-search-data-export');
 const fs = require('fs')
+const path = require('path');
 const Database = require('better-sqlite3');
 
 function sqliteOutput({ outPath }) {
   return function ({ pois, streets, streetJunctions }) {
-    if (!fs.existsSync(outPath)) {
+    if (!fs.existsSync(path.dirname(outPath))) {
       throw new Error("Invalid SQLite output path");
     }
 
