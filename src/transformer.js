@@ -211,7 +211,9 @@ class Transformation {
       const featureCollection = geoFeatureCollection(points);
       const hull = geoConcave(featureCollection);
 
-      this.cityPolygons[name] = hull;
+      if (hull !== null) {
+        this.cityPolygons[name] = hull;
+      }
     }
   }
 
