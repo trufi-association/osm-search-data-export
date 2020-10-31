@@ -4,3 +4,4 @@ node_modules/
 /search.db
 /search.json
 /search-compact.json
+/out/

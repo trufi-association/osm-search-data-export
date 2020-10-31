@@ -1,0 +1,10 @@
+version: '3.8'
+
+services: 
+    osm-search-data-export:
+        build: .
+        image: osm-search-data-export:latest
+        container_name: osm-search-data-export
+        env_file: cochabamba.env
+        volumes: 
+            - ./out:/app/osm-search-data-export/out/
