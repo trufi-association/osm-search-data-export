@@ -78,6 +78,18 @@ $ osm-search-data-export --input overpass --bbox -21.604769,-64.819679,-21.47703
 
 Run `osm-search-data-export --help` for more details.
 
+### Docker
+
+```sh
+docker build . --tag osm-search-data-export:latest
+
+docker run --volume /tmp:/data osm-search-data-export \
+  --input overpass --bbox "-21.604769,-64.819679,-21.477032,-64.631195" \
+  --output json --outpath /data/search.json
+           
+; Wrote to file /tmp/search.json
+```
+
 ## Input types
 
 * json - JSON file that holds an array of OSM objects
@@ -96,15 +108,3 @@ Run `osm-search-data-export --help` for more details.
 ## Config
 
 Please consult `src/config.js` for a list of whitelisted types that will be included in the resulting file. See Usage on information on how to override these values.
-
-## Docker
-
-```sh
-docker build . --tag osm-search-data-export:latest
-
-docker run --volume /tmp:/data osm-search-data-export \
-  --input overpass --bbox "-21.604769,-64.819679,-21.477032,-64.631195" \
-  --output json --outpath /data/search.json
-           
-cat /tmp/search.json | less
-```
