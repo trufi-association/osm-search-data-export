@@ -1,0 +1,9 @@
+.editorconfig
+.eslintrc
+.gitignore
+README.md
+LICENSE
+/node_modules
+/*.js
+!/index.js
+!/cli.js
