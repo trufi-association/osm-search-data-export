@@ -97,7 +97,7 @@ Run `osm-search-data-export --help` for more details.
 
 Please consult `src/config.js` for a list of whitelisted types that will be included in the resulting file. See Usage on information on how to override these values.
 
-### Docker
+## Docker
 
 ```sh
 docker build . --tag osm-search-data-export:latest
