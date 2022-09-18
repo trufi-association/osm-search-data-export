@@ -66,16 +66,16 @@ searchDataExport(
 ### CLI
 
 ```sh
-$ osm-search-data-export --input pbf --inpath data.pbf --output json --outpath search.json
+$ node cli.js --input pbf --inpath data.pbf --output json --outpath search.json
 ; Wrote to file search.json
 ```
 
 ```sh
-$ osm-search-data-export --input overpass --bbox -21.604769,-64.819679,-21.477032,-64.631195 --output sqlite --outpath search.db
+$ node cli.js --input overpass --bbox -21.604769,-64.819679,-21.477032,-64.631195 --output sqlite --outpath search.db
 ; Wrote to file search.db
 ```
 
-Run `osm-search-data-export --help` for more details.
+Run `node cli.js --help` for more details.
 
 ### Docker
 
@@ -84,7 +84,7 @@ docker build . --tag osm-search-data-export:latest
 
 docker run --volume /tmp:/data osm-search-data-export \
   --input overpass --bbox "-21.604769,-64.819679,-21.477032,-64.631195" \
-  --output json --outpath /data/search.json
+  --output json-compact --outpath /data/search.json
            
 ; Wrote to file /tmp/search.json
 ```
@@ -99,7 +99,7 @@ docker run --volume /tmp:/data osm-search-data-export \
 ## Output types
 
 * json - Write search data to a JSON file
-* json-compact - Write search data to a JSON file in a more compact style
+* json-compact - Write search data to a JSON file in a more compact style - **this is the style required by Trufi-Core based apps for the `search.json`**
 * sqlite - Write search data into a SQLite db file');
 * memory - Write data into a local variable
 * multi - Wraps multiple outputs
