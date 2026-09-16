@@ -3,6 +3,7 @@ const without = require('lodash.without');
 const geoPoint = require('@turf/helpers').point;
 const geoFeatureCollection = require('@turf/helpers').featureCollection;
 const geoLineString = require('@turf/helpers').lineString;
+const geoPolygon = require('@turf/helpers').polygon;
 const geoDistance = require('@turf/distance').default;
 const geoAlong = require('@turf/along').default;
 const geoLength = require('@turf/length').default;
@@ -19,6 +20,97 @@ function getCenterCoordsOfPath(path) {
   const coords = centerPoint.geometry.coordinates;
 
   return coords;
+}
+
+// Planar shoelace area of a ring. It is only used to order polygons by size,
+// so computing it on raw lon/lat values is good enough.
+function getRingArea(ring) {
+  let sum = 0;
+
+  for (let i = 0; i < ring.length - 1; i++) {
+    sum += (ring[i][0] * ring[i + 1][1]) - (ring[i + 1][0] * ring[i][1]);
+  }
+
+  return Math.abs(sum) / 2;
+}
+
+function getPolygonArea(feature) {
+  const { type, coordinates } = feature.geometry;
+  const outerRings = type === 'MultiPolygon'
+    ? coordinates.map((polygonCoords) => polygonCoords[0])
+    : [coordinates[0]];
+
+  return outerRings.reduce((sum, ring) => sum + getRingArea(ring), 0);
+}
+
+// Appends a way (list of node ids) to whichever end of the chain it touches,
+// reversing it when needed. Returns null when the way does not connect.
+function joinWayToChain(chain, wayRefs) {
+  const chainStart = chain[0];
+  const chainEnd = chain[chain.length - 1];
+  const wayStart = wayRefs[0];
+  const wayEnd = wayRefs[wayRefs.length - 1];
+
+  if (wayStart === chainEnd) {
+    return chain.concat(wayRefs.slice(1));
+  }
+  if (wayEnd === chainEnd) {
+    return chain.concat(wayRefs.slice(0, -1).reverse());
+  }
+  if (wayEnd === chainStart) {
+    return wayRefs.slice(0, -1).concat(chain);
+  }
+  if (wayStart === chainStart) {
+    return wayRefs.slice(1).reverse().concat(chain);
+  }
+
+  return null;
+}
+
+// Stitches the outer ways of a boundary relation into closed rings by matching
+// their endpoint node ids. Chains that cannot be closed (ways clipped away by
+// the bounding box of the extract) are returned separately.
+function stitchOuterWays(outerWays) {
+  const segments = outerWays.filter((refs) => refs.length > 1);
+  const used = segments.map(() => false);
+  const rings = [];
+  const openChains = [];
+  const isClosed = (chain) => chain[0] === chain[chain.length - 1];
+  const isRing = (chain) => isClosed(chain) && chain.length >= 4;
+
+  segments.forEach((segment, i) => {
+    if (used[i]) {
+      return;
+    }
+
+    used[i] = true;
+    let chain = segment;
+    let extended = true;
+
+    // Ways closed on their own are rings of their own (exclaves) and are
+    // never joined onto another chain.
+    while (extended && !isClosed(chain)) {
+      extended = false;
+
+      for (let j = 0; j < segments.length && !extended; j++) {
+        const joined = used[j] || isClosed(segments[j]) ? null : joinWayToChain(chain, segments[j]);
+
+        if (joined !== null) {
+          chain = joined;
+          used[j] = true;
+          extended = true;
+        }
+      }
+    }
+
+    if (isRing(chain)) {
+      rings.push(chain);
+    } else {
+      openChains.push(chain);
+    }
+  });
+
+  return { rings, openChains };
 }
 
 class Transformation {
@@ -39,7 +131,7 @@ class Transformation {
     this.streets = {};
     this.streetJunctions = {};
     this.streetAlternativeNames = {};
-    this.cityPolygons = {};
+    this.regionPolygons = [];
   }
 
   addItem(item) {
@@ -203,21 +295,66 @@ class Transformation {
       && relation.tags.admin_level === '8'
     ) {
       const { name } = relation.tags;
-      const points = relation.members
+      // Overpass JSON calls the member id "ref", osm-pbf-parser calls it "id".
+      const outerWays = relation.members
         .filter((member) => member.type === 'way' && member.role === 'outer')
-        .map((member) => this.ways[member.ref])
+        .map((member) => this.ways[member.ref != null ? member.ref : member.id])
         .filter((way) => way != null)
-        .flatMap((way) => way.refs || way.nodes)
-        .map((ref) => this.nodes[ref])
-        .filter((coords) => coords != null)
-        .map((coords) => geoPoint(coords));
-      const featureCollection = geoFeatureCollection(points);
-      const hull = geoConcave(featureCollection);
+        .map((way) => way.refs || way.nodes);
+      const { rings, openChains } = stitchOuterWays(outerWays);
+      // An open chain is missing ways clipped away by the bounding box of the
+      // extract: closing it with a straight segment is accurate enough there.
+      const polygons = rings.concat(openChains)
+        .map((chain) => this.buildRingPolygon(chain))
+        .filter((polygon) => polygon != null);
 
-      if (hull !== null) {
-        this.cityPolygons[name] = hull;
+      if (polygons.length === 0) {
+        // Nothing to stitch: fall back to a concave hull of the outer nodes.
+        const hull = this.buildConcaveHull(outerWays);
+
+        if (hull != null) {
+          polygons.push(hull);
+        }
       }
+
+      debug(`Boundary ${name}: ${rings.length} ring(s), ${openChains.length} open chain(s), ${polygons.length} polygon(s)`);
+
+      polygons.forEach((polygon) => {
+        this.regionPolygons.push({
+          name,
+          polygon,
+          area: getPolygonArea(polygon),
+          order: this.regionPolygons.length,
+        });
+      });
     }
+  }
+
+  // Turns a chain of node ids into a polygon feature. Nodes missing from the
+  // extract are skipped and the ring is closed when needed. Returns null for
+  // degenerate rings with fewer than three distinct positions.
+  buildRingPolygon(chain) {
+    const refs = chain.filter((ref) => this.nodes[ref] != null);
+
+    if (refs.length > 0 && refs[0] !== refs[refs.length - 1]) {
+      refs.push(refs[0]);
+    }
+
+    if (refs.length < 4) {
+      return null;
+    }
+
+    return geoPolygon([refs.map((ref) => this.nodes[ref])]);
+  }
+
+  buildConcaveHull(outerWays) {
+    const points = outerWays
+      .flat()
+      .map((ref) => this.nodes[ref])
+      .filter((coords) => coords != null)
+      .map((coords) => geoPoint(coords));
+
+    return geoConcave(geoFeatureCollection(points));
   }
 
   hasSupportedStreetTags(tags) {
@@ -295,6 +432,16 @@ class Transformation {
   extractStreets() {
     let i = 1;
 
+    // Smallest polygon first, so a street inside nested boundaries gets the
+    // innermost one. Ties keep relation order.
+    this.regionPolygons.sort((a, b) => {
+      if (a.area !== b.area) {
+        return a.area - b.area;
+      }
+
+      return a.order - b.order;
+    });
+
     Object.keys(this.streetToNodes)
       .sort(intlCompare)
       .forEach((street) => {
@@ -308,10 +455,9 @@ class Transformation {
         const path = this.streetToNodes[street].map((nodeId) => this.nodes[nodeId]);
         const coordinates = getCenterCoordsOfPath(path);
         const centerPoint = geoPoint(coordinates);
-        const region = Object.keys(this.cityPolygons).find((name) => {
-          const polygon = this.cityPolygons[name];
-          return geoPointInPolygon(centerPoint, polygon);
-        });
+        const match = this.regionPolygons
+          .find((entry) => geoPointInPolygon(centerPoint, entry.polygon));
+        const region = match ? match.name : undefined;
 
         this.streets[id] = {
           name: street,

@@ -104,6 +104,17 @@ docker run --volume /tmp:/data osm-search-data-export \
 * memory - Write data into a local variable
 * multi - Wraps multiple outputs
 
+## Street regions
+
+Every street carries a `region`: the name of the municipality it lies in, taken from the
+`admin_level=8` boundary relations (`type=boundary`, `boundary=administrative`) found in the
+input. The outer ways of each relation are stitched into rings and the centre point of the
+street is tested against them; when it falls into several polygons the smallest one wins.
+The input must contain the boundary relations and their outer ways (Overpass and PBF extracts
+include both). Outer ways clipped away by the bounding box of an extract are tolerated: the
+remaining chain is closed with a straight segment, so municipalities at the edge of the extract
+are only approximate there. Streets outside every municipality get `null`.
+
 ## Config
 
 Please consult `src/config.js` for a list of whitelisted types that will be included in the resulting file. See Usage on information on how to override these values.

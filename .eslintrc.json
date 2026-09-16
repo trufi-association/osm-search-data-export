@@ -6,6 +6,9 @@
     "node": true,
     "es6": true
   },
+  "settings": {
+    "import/core-modules": ["node:test"]
+  },
   "rules": {
     "no-plusplus": ["error", { "allowForLoopAfterthoughts": true }]
   }
