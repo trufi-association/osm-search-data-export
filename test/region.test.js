@@ -39,10 +39,14 @@ class Dataset {
     return id;
   }
 
+  // A residential street over existing nodes.
+  streetWay(name, refs) {
+    return this.way(refs, { name, highway: 'residential' });
+  }
+
   // A residential street between two coordinates.
   street(name, [lon1, lat1], [lon2, lat2]) {
-    const refs = [this.node(lon1, lat1), this.node(lon2, lat2)];
-    return this.way(refs, { name, highway: 'residential' });
+    return this.streetWay(name, [this.node(lon1, lat1), this.node(lon2, lat2)]);
   }
 
   // Municipality boundary relation. `memberKey` selects the member id field:
@@ -60,19 +64,33 @@ class Dataset {
     });
   }
 
-  // Runs the transformer and returns { streetName: region }.
-  regions() {
+  // Runs the transformer and returns its result.
+  run() {
     const transformer = new Transformer(createConfig({}));
-    const regions = {};
 
     [].concat(this.nodes, this.ways, this.relations).forEach((item) => transformer.addItem(item));
-    Object.values(transformer.complete().streets).forEach((street) => {
+
+    return transformer.complete();
+  }
+
+  // Runs the transformer and returns { streetName: region }.
+  regions() {
+    const regions = {};
+
+    Object.values(this.run().streets).forEach((street) => {
       regions[street.name] = street.region;
     });
 
     return regions;
   }
 }
+
+const assertNear = (actual, expected) => {
+  assert.equal(actual.length, expected.length);
+  actual.forEach((value, i) => {
+    assert.ok(Math.abs(value - expected[i]) < 1e-3, `${actual} is not near ${expected}`);
+  });
+};
 
 const square = (x, y, size) => [[x, y], [x + size, y], [x + size, y + size], [x, y + size]];
 
@@ -168,5 +186,76 @@ describe('street region from admin_level=8 boundary relations', () => {
       'In the enclave': 'Enclave',
       'In the outer municipality': 'Outer',
     });
+  });
+});
+
+describe('streets split by municipality', () => {
+  // Two adjacent square municipalities A and B. "Calle Abaroa" exists in A, in B
+  // and outside both; the crossings with "Calle Norte" (A) and "Calle Sur" (B)
+  // share a node with the respective Abaroa way.
+  const build = () => {
+    const ds = new Dataset();
+    const [a1, a2, a3, a4] = ds.corners(square(0, 0, 1));
+    const [b1, b2, b3, b4] = ds.corners(square(1, 0, 1));
+    ds.municipality('A', [ds.way([a1, a2, a3, a4, a1])]);
+    ds.municipality('B', [ds.way([b1, b2, b3, b4, b1])]);
+    const crossA = ds.node(0.5, 0.5);
+    const crossB = ds.node(1.5, 0.5);
+    ds.streetWay('Calle Abaroa', [ds.node(0.2, 0.5), crossA, ds.node(0.8, 0.5)]);
+    ds.streetWay('Calle Abaroa', [ds.node(1.2, 0.5), crossB, ds.node(1.8, 0.5)]);
+    ds.street('Calle Abaroa', [5, 5], [6, 5]);
+    ds.streetWay('Calle Norte', [ds.node(0.5, 0.2), crossA, ds.node(0.5, 0.8)]);
+    ds.streetWay('Calle Sur', [ds.node(1.5, 0.2), crossB, ds.node(1.5, 0.8)]);
+
+    return ds.run();
+  };
+
+  it('exports one street per name and municipality, sorted by name then region', () => {
+    const { streets } = build();
+    const rows = Object.entries(streets).map(([id, street]) => [id, street.name, street.region]);
+
+    assert.deepEqual(rows, [
+      ['s1', 'Calle Abaroa', 'A'],
+      ['s2', 'Calle Abaroa', 'B'],
+      ['s3', 'Calle Abaroa', undefined],
+      ['s4', 'Calle Norte', 'A'],
+      ['s5', 'Calle Sur', 'B'],
+    ]);
+  });
+
+  it('gives each street its own centre', () => {
+    const { streets } = build();
+
+    assertNear(streets.s1.coordinates, [0.5, 0.5]);
+    assertNear(streets.s2.coordinates, [1.5, 0.5]);
+    assertNear(streets.s3.coordinates, [5.5, 5]);
+  });
+
+  it('attaches junctions to the street whose ways meet at the node', () => {
+    const { streetJunctions } = build();
+    const refs = (id) => (streetJunctions[id] || []).map((junction) => junction.streetRef);
+
+    assert.deepEqual(refs('s4'), ['s1']);
+    assert.deepEqual(refs('s5'), ['s2']);
+    assert.deepEqual(refs('s1'), ['s4']);
+    assert.deepEqual(refs('s2'), ['s5']);
+    assert.deepEqual(refs('s3'), []);
+    assertNear(streetJunctions.s4[0].coordinates, [0.5, 0.5]);
+  });
+
+  it('merges the ways of one street inside one municipality', () => {
+    const ds = new Dataset();
+    const [c1, c2, c3, c4] = ds.corners(square(0, 0, 1));
+    ds.municipality('M', [ds.way([c1, c2, c3, c4, c1])]);
+    const shared = ds.node(0.5, 0.5);
+    ds.streetWay('Calle Larga', [ds.node(0.1, 0.5), shared]);
+    ds.streetWay('Calle Larga', [shared, ds.node(0.9, 0.5)]);
+
+    const { streets, streetJunctions } = ds.run();
+
+    assert.deepEqual(Object.keys(streets), ['s1']);
+    assert.equal(streets.s1.region, 'M');
+    assertNear(streets.s1.coordinates, [0.5, 0.5]);
+    assert.deepEqual(streetJunctions, {});
   });
 });

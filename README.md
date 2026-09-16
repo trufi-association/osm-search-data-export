@@ -108,8 +108,11 @@ docker run --volume /tmp:/data osm-search-data-export \
 
 Every street carries a `region`: the name of the municipality it lies in, taken from the
 `admin_level=8` boundary relations (`type=boundary`, `boundary=administrative`) found in the
-input. The outer ways of each relation are stitched into rings and the centre point of the
-street is tested against them; when it falls into several polygons the smallest one wins.
+input. The outer ways of each relation are stitched into rings and every highway way is
+assigned the municipality its middle node falls in; when it falls into several polygons the
+smallest one wins. Streets are grouped by name **and** municipality, so a name that exists in
+several towns of the extract yields one street entry per town, each with its own centre and
+junctions. Streets are sorted by name, then by region.
 The input must contain the boundary relations and their outer ways (Overpass and PBF extracts
 include both). Outer ways clipped away by the bounding box of an extract are tolerated: the
 remaining chain is closed with a straight segment, so municipalities at the edge of the extract

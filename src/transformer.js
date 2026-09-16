@@ -34,13 +34,46 @@ function getRingArea(ring) {
   return Math.abs(sum) / 2;
 }
 
-function getPolygonArea(feature) {
+function getOuterRings(feature) {
   const { type, coordinates } = feature.geometry;
-  const outerRings = type === 'MultiPolygon'
+
+  return type === 'MultiPolygon'
     ? coordinates.map((polygonCoords) => polygonCoords[0])
     : [coordinates[0]];
+}
 
-  return outerRings.reduce((sum, ring) => sum + getRingArea(ring), 0);
+function getPolygonArea(feature) {
+  return getOuterRings(feature).reduce((sum, ring) => sum + getRingArea(ring), 0);
+}
+
+// Copy of the feature with its bounding box set, which lets point-in-polygon
+// tests skip polygons far away from the point.
+function withBoundingBox(feature) {
+  const bbox = [Infinity, Infinity, -Infinity, -Infinity];
+
+  getOuterRings(feature).flat().forEach(([lon, lat]) => {
+    bbox[0] = Math.min(bbox[0], lon);
+    bbox[1] = Math.min(bbox[1], lat);
+    bbox[2] = Math.max(bbox[2], lon);
+    bbox[3] = Math.max(bbox[3], lat);
+  });
+
+  return { ...feature, bbox };
+}
+
+// Orders streets by name, then by municipality; streets outside every
+// municipality come last.
+function compareStreetEntities(a, b) {
+  const byName = intlCompare(a.name, b.name);
+
+  if (byName !== 0) {
+    return byName;
+  }
+  if (a.region == null || b.region == null) {
+    return (a.region == null ? 1 : 0) - (b.region == null ? 1 : 0);
+  }
+
+  return intlCompare(a.region, b.region);
 }
 
 // Appends a way (list of node ids) to whichever end of the chain it touches,
@@ -123,11 +156,8 @@ class Transformation {
     this.nodes = {};
     this.ways = {};
     this.pois = [];
-    this.nodeToStreet = {};
-    this.streetToNodeGroups = {};
-    this.streetToNodes = {};
-    this.streetsToIds = {};
-    this.idsToStreets = {};
+    this.streetWayGroups = [];
+    this.nodeToWayGroups = {};
     this.streets = {};
     this.streetJunctions = {};
     this.streetAlternativeNames = {};
@@ -154,8 +184,10 @@ class Transformation {
   }
 
   complete() {
-    debug('Flattening street node groups');
-    this.flattenStreetNodeGroups();
+    debug('Sorting region polygons');
+    this.sortRegionPolygons();
+    debug('Assigning regions to street ways');
+    this.assignWayGroupRegions();
     debug('Extracting streets');
     this.extractStreets();
     debug('Extracting street junctions');
@@ -241,18 +273,20 @@ class Transformation {
     // We only list highway types as streets. Everything else will end up
     // a point of interest.
     if (this.hasSupportedStreetTags(tags)) {
-      // Assign street name to node (a node can be linked to multiple streets)
-      refs.forEach((ref) => {
-        this.nodeToStreet[ref] = this.nodeToStreet[ref] || [];
+      // Collect the way as a group of nodes under its street name. The groups
+      // are split into one street per municipality in complete(), once the
+      // boundary relations (last in the input) have been read.
+      const group = { name, refs };
+      this.streetWayGroups.push(group);
 
-        if (this.nodeToStreet[ref].indexOf(name) === -1) {
-          this.nodeToStreet[ref].push(name);
+      // Link the node to the way (a node can be shared by several streets)
+      refs.forEach((ref) => {
+        this.nodeToWayGroups[ref] = this.nodeToWayGroups[ref] || [];
+
+        if (this.nodeToWayGroups[ref].indexOf(group) === -1) {
+          this.nodeToWayGroups[ref].push(group);
         }
       });
-
-      // Collect all ways that belong to a street (by name)
-      this.streetToNodeGroups[name] = this.streetToNodeGroups[name] || [];
-      this.streetToNodeGroups[name].push(refs);
 
       // Save alt names
       if (alternativeNames) {
@@ -322,7 +356,7 @@ class Transformation {
       polygons.forEach((polygon) => {
         this.regionPolygons.push({
           name,
-          polygon,
+          polygon: withBoundingBox(polygon),
           area: getPolygonArea(polygon),
           order: this.regionPolygons.length,
         });
@@ -403,37 +437,9 @@ class Transformation {
     return null;
   }
 
-  // Flattens collection of ways per street by first sorting ways
-  // by looking at their distance to each other.
-  flattenStreetNodeGroups() {
-    Object.keys(this.streetToNodeGroups)
-      .forEach((street) => {
-        const sortedGroups = this.streetToNodeGroups[street].sort((a, b) => {
-          const aFirst = geoPoint(this.nodes[a[0]]);
-          const aLast = geoPoint(this.nodes[a[a.length - 1]]);
-          const bFirst = geoPoint(this.nodes[b[0]]);
-          const bLast = geoPoint(this.nodes[b[b.length - 1]]);
-          const abDistance = geoDistance(aLast, bFirst);
-          const baDistance = geoDistance(bLast, aFirst);
-
-          if (abDistance < baDistance) {
-            return -1;
-          }
-          if (abDistance > baDistance) {
-            return 1;
-          }
-          return 0;
-        });
-
-        this.streetToNodes[street] = sortedGroups.flat();
-      });
-  }
-
-  extractStreets() {
-    let i = 1;
-
-    // Smallest polygon first, so a street inside nested boundaries gets the
-    // innermost one. Ties keep relation order.
+  // Smallest polygon first, so a point inside nested boundaries gets the
+  // innermost one. Ties keep relation order.
+  sortRegionPolygons() {
     this.regionPolygons.sort((a, b) => {
       if (a.area !== b.area) {
         return a.area - b.area;
@@ -441,26 +447,81 @@ class Transformation {
 
       return a.order - b.order;
     });
+  }
 
-    Object.keys(this.streetToNodes)
-      .sort(intlCompare)
-      .forEach((street) => {
-        const id = `s${i}`;
-        i += 1;
+  findRegion(coordinates) {
+    const point = geoPoint(coordinates);
+    const match = this.regionPolygons
+      .find((entry) => geoPointInPolygon(point, entry.polygon));
 
-        this.streetsToIds[street] = id;
-        this.idsToStreets[id] = street;
+    return match ? match.name : undefined;
+  }
 
-        const alternativeNames = this.streetAlternativeNames[street] || [];
-        const path = this.streetToNodes[street].map((nodeId) => this.nodes[nodeId]);
+  // Each way belongs to the municipality its middle node lies in.
+  assignWayGroupRegions() {
+    for (let i = 0; i < this.streetWayGroups.length; i++) {
+      const group = this.streetWayGroups[i];
+      const middleNode = group.refs[Math.floor(group.refs.length / 2)];
+
+      group.region = this.findRegion(this.nodes[middleNode]);
+    }
+  }
+
+  // Flattens a collection of ways by first sorting them
+  // by looking at their distance to each other.
+  flattenNodeGroups(nodeGroups) {
+    const sortedGroups = nodeGroups.slice().sort((a, b) => {
+      const aFirst = geoPoint(this.nodes[a[0]]);
+      const aLast = geoPoint(this.nodes[a[a.length - 1]]);
+      const bFirst = geoPoint(this.nodes[b[0]]);
+      const bLast = geoPoint(this.nodes[b[b.length - 1]]);
+      const abDistance = geoDistance(aLast, bFirst);
+      const baDistance = geoDistance(bLast, aFirst);
+
+      if (abDistance < baDistance) {
+        return -1;
+      }
+      if (abDistance > baDistance) {
+        return 1;
+      }
+      return 0;
+    });
+
+    return sortedGroups.flat();
+  }
+
+  // Builds one street per name and municipality: a name shared by several
+  // towns of the extract yields one street per town, each with its own
+  // centre and region.
+  extractStreets() {
+    const entities = new Map();
+
+    for (let i = 0; i < this.streetWayGroups.length; i++) {
+      const group = this.streetWayGroups[i];
+      const key = JSON.stringify([group.name, group.region || null]);
+
+      if (!entities.has(key)) {
+        entities.set(key, { name: group.name, region: group.region, groups: [] });
+      }
+      entities.get(key).groups.push(group);
+    }
+
+    Array.from(entities.values())
+      .sort(compareStreetEntities)
+      .forEach((entity, index) => {
+        const id = `s${index + 1}`;
+        const { name, region, groups } = entity;
+        const alternativeNames = this.streetAlternativeNames[name] || [];
+        const nodeIds = this.flattenNodeGroups(groups.map((group) => group.refs));
+        const path = nodeIds.map((nodeId) => this.nodes[nodeId]);
         const coordinates = getCenterCoordsOfPath(path);
-        const centerPoint = geoPoint(coordinates);
-        const match = this.regionPolygons
-          .find((entry) => geoPointInPolygon(centerPoint, entry.polygon));
-        const region = match ? match.name : undefined;
+
+        for (let i = 0; i < groups.length; i++) {
+          groups[i].streetId = id;
+        }
 
         this.streets[id] = {
-          name: street,
+          name,
           alternativeNames,
           coordinates,
           region,
@@ -468,29 +529,32 @@ class Transformation {
       });
   }
 
+  // A junction is a node shared by the ways of two or more streets.
   extractStreetJunctions() {
-    Object.keys(this.nodeToStreet)
+    Object.keys(this.nodeToWayGroups)
       .forEach((nodeId) => {
-        if (this.nodeToStreet[nodeId].length > 1) {
-          this.nodeToStreet[nodeId].forEach((street) => {
-            const streetId = this.streetsToIds[street];
+        const streetIds = this.nodeToWayGroups[nodeId]
+          .map((group) => group.streetId)
+          .filter((streetId, index, ids) => ids.indexOf(streetId) === index);
 
+        if (streetIds.length > 1) {
+          streetIds.forEach((streetId) => {
             this.streetJunctions[streetId] = this.streetJunctions[streetId] || [];
 
-            const existingStreetNames = this.streetJunctions[streetId]
-              .map((entry) => this.idsToStreets[entry.streetRef]);
+            const existingStreetRefs = this.streetJunctions[streetId]
+              .map((entry) => entry.streetRef);
 
-            const streetObjs = without(this.nodeToStreet[nodeId], street, ...existingStreetNames)
-              .map((junctionStreet) => ({
-                streetRef: this.streetsToIds[junctionStreet],
+            const streetObjs = without(streetIds, streetId, ...existingStreetRefs)
+              .map((junctionStreetId) => ({
+                streetRef: junctionStreetId,
                 coordinates: this.nodes[nodeId],
               }));
 
             this.streetJunctions[streetId] = this.streetJunctions[streetId]
               .concat(streetObjs)
-              .sort((a, b) => intlCompare(
-                this.idsToStreets[a.streetRef],
-                this.idsToStreets[b.streetRef],
+              .sort((a, b) => compareStreetEntities(
+                this.streets[a.streetRef],
+                this.streets[b.streetRef],
               ));
           });
         }
