@@ -23,7 +23,7 @@
     "@turf/distance": "^6.5.0",
     "@turf/helpers": "^6.5.0",
     "@turf/length": "^6.5.0",
-    "better-sqlite3": "^7.4.3",
+    "better-sqlite3": "^13.0.3",
     "commander": "^8.1.0",
     "debug": "^4.3.2",
     "lodash.without": "^4.4.0",
