@@ -12,7 +12,7 @@
   "author": "Malte Dölker <mdoelker@me.com>",
   "license": "MIT",
   "engines": {
-    "node": ">=11.0.0"
+    "node": ">=22"
   },
   "dependencies": {
     "@derhuerst/query-overpass": "^2.0.0",
