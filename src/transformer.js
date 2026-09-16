@@ -3,6 +3,7 @@ const without = require('lodash.without');
 const geoPoint = require('@turf/helpers').point;
 const geoFeatureCollection = require('@turf/helpers').featureCollection;
 const geoLineString = require('@turf/helpers').lineString;
+const geoPolygon = require('@turf/helpers').polygon;
 const geoDistance = require('@turf/distance').default;
 const geoAlong = require('@turf/along').default;
 const geoLength = require('@turf/length').default;
@@ -10,7 +11,8 @@ const geoCenterOfMass = require('@turf/center-of-mass').default;
 const geoConcave = require('@turf/concave').default;
 const geoPointInPolygon = require('@turf/boolean-point-in-polygon').default;
 
-const intlCompare = new Intl.Collator().compare;
+// A fixed locale keeps the street ids independent of the machine's locale.
+const intlCompare = new Intl.Collator('en').compare;
 
 function getCenterCoordsOfPath(path) {
   const lineString = geoLineString(path);
@@ -19,6 +21,169 @@ function getCenterCoordsOfPath(path) {
   const coords = centerPoint.geometry.coordinates;
 
   return coords;
+}
+
+// Planar shoelace area of a ring. It is only used to order polygons by size,
+// so computing it on raw lon/lat values is good enough.
+function getRingArea(ring) {
+  let sum = 0;
+
+  for (let i = 0; i < ring.length - 1; i++) {
+    sum += (ring[i][0] * ring[i + 1][1]) - (ring[i + 1][0] * ring[i][1]);
+  }
+
+  return Math.abs(sum) / 2;
+}
+
+// Side of the directed line p-q the point r lies on: 1, -1 or 0 (collinear).
+function orientation(p, q, r) {
+  const value = ((q[1] - p[1]) * (r[0] - q[0])) - ((q[0] - p[0]) * (r[1] - q[1]));
+
+  if (value === 0) {
+    return 0;
+  }
+
+  return value > 0 ? 1 : -1;
+}
+
+// Whether the segments a-b and c-d properly cross each other (plain 2-D test;
+// touching at an endpoint does not count).
+function segmentsCross(a, b, c, d) {
+  const o1 = orientation(a, b, c);
+  const o2 = orientation(a, b, d);
+  const o3 = orientation(c, d, a);
+  const o4 = orientation(c, d, b);
+
+  return o1 * o2 < 0 && o3 * o4 < 0;
+}
+
+// Whether the segment that closes a ring (last to first position) crosses any
+// other segment of the ring, which would make the ring self-intersecting.
+function closingSegmentCrossesRing(ring) {
+  const last = ring.length - 1; // ring[last] equals ring[0]
+  const closingStart = ring[last - 1];
+  const closingEnd = ring[last];
+
+  // The two segments adjacent to the closing one share an endpoint with it.
+  for (let i = 1; i < last - 2; i++) {
+    if (segmentsCross(closingStart, closingEnd, ring[i], ring[i + 1])) {
+      return true;
+    }
+  }
+
+  return false;
+}
+
+function getOuterRings(feature) {
+  const { type, coordinates } = feature.geometry;
+
+  return type === 'MultiPolygon'
+    ? coordinates.map((polygonCoords) => polygonCoords[0])
+    : [coordinates[0]];
+}
+
+function getPolygonArea(feature) {
+  return getOuterRings(feature).reduce((sum, ring) => sum + getRingArea(ring), 0);
+}
+
+// Copy of the feature with its bounding box set, which lets point-in-polygon
+// tests skip polygons far away from the point.
+function withBoundingBox(feature) {
+  const bbox = [Infinity, Infinity, -Infinity, -Infinity];
+
+  getOuterRings(feature).flat().forEach(([lon, lat]) => {
+    bbox[0] = Math.min(bbox[0], lon);
+    bbox[1] = Math.min(bbox[1], lat);
+    bbox[2] = Math.max(bbox[2], lon);
+    bbox[3] = Math.max(bbox[3], lat);
+  });
+
+  return { ...feature, bbox };
+}
+
+// Orders streets by name, then by municipality; streets outside every
+// municipality come last.
+function compareStreetEntities(a, b) {
+  const byName = intlCompare(a.name, b.name);
+
+  if (byName !== 0) {
+    return byName;
+  }
+  if (a.region == null || b.region == null) {
+    return (a.region == null ? 1 : 0) - (b.region == null ? 1 : 0);
+  }
+
+  return intlCompare(a.region, b.region);
+}
+
+// Appends a way (list of node ids) to whichever end of the chain it touches,
+// reversing it when needed. Returns null when the way does not connect.
+function joinWayToChain(chain, wayRefs) {
+  const chainStart = chain[0];
+  const chainEnd = chain[chain.length - 1];
+  const wayStart = wayRefs[0];
+  const wayEnd = wayRefs[wayRefs.length - 1];
+
+  if (wayStart === chainEnd) {
+    return chain.concat(wayRefs.slice(1));
+  }
+  if (wayEnd === chainEnd) {
+    return chain.concat(wayRefs.slice(0, -1).reverse());
+  }
+  if (wayEnd === chainStart) {
+    return wayRefs.slice(0, -1).concat(chain);
+  }
+  if (wayStart === chainStart) {
+    return wayRefs.slice(1).reverse().concat(chain);
+  }
+
+  return null;
+}
+
+// Stitches the outer ways of a boundary relation into closed rings by matching
+// their endpoint node ids. Chains that cannot be closed (ways clipped away by
+// the bounding box of the extract) are returned separately.
+function stitchOuterWays(outerWays) {
+  const segments = outerWays.filter((refs) => refs.length > 1);
+  const used = segments.map(() => false);
+  const rings = [];
+  const openChains = [];
+  const isClosed = (chain) => chain[0] === chain[chain.length - 1];
+  const isRing = (chain) => isClosed(chain) && chain.length >= 4;
+
+  segments.forEach((segment, i) => {
+    if (used[i]) {
+      return;
+    }
+
+    used[i] = true;
+    let chain = segment;
+    let extended = true;
+
+    // Ways closed on their own are rings of their own (exclaves) and are
+    // never joined onto another chain.
+    while (extended && !isClosed(chain)) {
+      extended = false;
+
+      for (let j = 0; j < segments.length && !extended; j++) {
+        const joined = used[j] || isClosed(segments[j]) ? null : joinWayToChain(chain, segments[j]);
+
+        if (joined !== null) {
+          chain = joined;
+          used[j] = true;
+          extended = true;
+        }
+      }
+    }
+
+    if (isRing(chain)) {
+      rings.push(chain);
+    } else {
+      openChains.push(chain);
+    }
+  });
+
+  return { rings, openChains };
 }
 
 class Transformation {
@@ -31,15 +196,11 @@ class Transformation {
     this.nodes = {};
     this.ways = {};
     this.pois = [];
-    this.nodeToStreet = {};
-    this.streetToNodeGroups = {};
-    this.streetToNodes = {};
-    this.streetsToIds = {};
-    this.idsToStreets = {};
+    this.streetWayGroups = [];
+    this.nodeToWayGroups = {};
     this.streets = {};
     this.streetJunctions = {};
-    this.streetAlternativeNames = {};
-    this.cityPolygons = {};
+    this.regionPolygons = [];
   }
 
   addItem(item) {
@@ -62,8 +223,10 @@ class Transformation {
   }
 
   complete() {
-    debug('Flattening street node groups');
-    this.flattenStreetNodeGroups();
+    debug('Sorting region polygons');
+    this.sortRegionPolygons();
+    debug('Assigning regions to street ways');
+    this.assignWayGroupRegions();
     debug('Extracting streets');
     this.extractStreets();
     debug('Extracting street junctions');
@@ -133,12 +296,17 @@ class Transformation {
 
   // eslint-disable-next-line complexity, max-statements
   processWay(way) {
-    this.ways[way.id] = way;
-
     const { tags = {} } = way;
     const { name, alt_name: altName } = tags;
     const refs = way.refs || way.nodes;
     const alternativeNames = altName ? altName.split(';') : [];
+
+    // A way needs at least two nodes to be a path or an area.
+    if (!refs || refs.length < 2) {
+      return;
+    }
+
+    this.ways[way.id] = way;
 
     // For ways that run out of the bounding box, we might be
     // missing referenced nodes. Skip way in that case.
@@ -149,23 +317,20 @@ class Transformation {
     // We only list highway types as streets. Everything else will end up
     // a point of interest.
     if (this.hasSupportedStreetTags(tags)) {
-      // Assign street name to node (a node can be linked to multiple streets)
-      refs.forEach((ref) => {
-        this.nodeToStreet[ref] = this.nodeToStreet[ref] || [];
+      // Collect the way as a group of nodes under its street name. The groups
+      // are split into one street per municipality in complete(), once the
+      // boundary relations (last in the input) have been read.
+      const group = { name, refs, alternativeNames };
+      this.streetWayGroups.push(group);
 
-        if (this.nodeToStreet[ref].indexOf(name) === -1) {
-          this.nodeToStreet[ref].push(name);
+      // Link the node to the way (a node can be shared by several streets)
+      refs.forEach((ref) => {
+        this.nodeToWayGroups[ref] = this.nodeToWayGroups[ref] || [];
+
+        if (this.nodeToWayGroups[ref].indexOf(group) === -1) {
+          this.nodeToWayGroups[ref].push(group);
         }
       });
-
-      // Collect all ways that belong to a street (by name)
-      this.streetToNodeGroups[name] = this.streetToNodeGroups[name] || [];
-      this.streetToNodeGroups[name].push(refs);
-
-      // Save alt names
-      if (alternativeNames) {
-        this.streetAlternativeNames[name] = alternativeNames;
-      }
     } else if (this.hasSupportedPoiTags(tags)) {
       const localizedNames = {};
       const address = null;
@@ -200,24 +365,94 @@ class Transformation {
       relation.tags
       && relation.tags.type === 'boundary'
       && relation.tags.boundary === 'administrative'
-      && relation.tags.admin_level === '8'
+      && String(relation.tags.admin_level) === '8'
     ) {
       const { name } = relation.tags;
-      const points = relation.members
-        .filter((member) => member.type === 'way' && member.role === 'outer')
-        .map((member) => this.ways[member.ref])
-        .filter((way) => way != null)
-        .flatMap((way) => way.refs || way.nodes)
-        .map((ref) => this.nodes[ref])
-        .filter((coords) => coords != null)
-        .map((coords) => geoPoint(coords));
-      const featureCollection = geoFeatureCollection(points);
-      const hull = geoConcave(featureCollection);
 
-      if (hull !== null) {
-        this.cityPolygons[name] = hull;
+      if (!name) {
+        debug(`Boundary relation ${relation.id} has no name, skipping`);
+        return;
       }
+
+      // Overpass JSON calls the member id "ref", osm-pbf-parser calls it "id".
+      // A way listed twice (a data error) would close a chain onto itself.
+      const outerWays = relation.members
+        .filter((member) => member.type === 'way' && member.role === 'outer')
+        .map((member) => (member.ref != null ? member.ref : member.id))
+        .filter((wayId, index, wayIds) => wayIds.indexOf(wayId) === index)
+        .map((wayId) => this.ways[wayId])
+        .filter((way) => way != null)
+        .map((way) => way.refs || way.nodes);
+      const { rings, openChains } = stitchOuterWays(outerWays);
+      const polygons = rings
+        .map((chain) => this.buildRingPolygon(chain))
+        .concat(openChains.map((chain) => this.buildOpenChainPolygon(chain, name)))
+        .filter((polygon) => polygon != null);
+
+      if (polygons.length === 0) {
+        // Nothing to stitch: fall back to a concave hull of the outer nodes.
+        const hull = this.buildConcaveHull(outerWays);
+
+        if (hull != null) {
+          polygons.push(hull);
+        }
+      }
+
+      debug(`Boundary ${name}: ${rings.length} ring(s), ${openChains.length} open chain(s), ${polygons.length} polygon(s)`);
+
+      polygons.forEach((polygon) => {
+        this.regionPolygons.push({
+          name,
+          polygon: withBoundingBox(polygon),
+          area: getPolygonArea(polygon),
+          order: this.regionPolygons.length,
+        });
+      });
     }
+  }
+
+  // Turns a chain of node ids into a polygon feature. Nodes missing from the
+  // extract are skipped and the ring is closed when needed. Returns null for
+  // degenerate rings with fewer than three distinct positions.
+  buildRingPolygon(chain) {
+    const refs = chain.filter((ref) => this.nodes[ref] != null);
+
+    if (refs.length > 0 && refs[0] !== refs[refs.length - 1]) {
+      refs.push(refs[0]);
+    }
+
+    if (refs.length < 4) {
+      return null;
+    }
+
+    return geoPolygon([refs.map((ref) => this.nodes[ref])]);
+  }
+
+  // An open chain is a boundary whose other ways were clipped away by the
+  // bounding box of the extract, the normal case at its edge. It is closed
+  // with a straight segment from its last to its first node. When that
+  // segment crosses the chain the ring would self-intersect and the even-odd
+  // point-in-polygon test would flip parts of it, so the concave hull of the
+  // chain's nodes is used instead.
+  buildOpenChainPolygon(chain, name) {
+    const polygon = this.buildRingPolygon(chain);
+
+    if (polygon != null && closingSegmentCrossesRing(polygon.geometry.coordinates[0])) {
+      debug(`Boundary ${name}: the closing segment crosses the chain, using its concave hull`);
+      return this.buildConcaveHull([chain]);
+    }
+
+    return polygon;
+  }
+
+  buildConcaveHull(outerWays) {
+    const points = outerWays
+      .flat()
+      .map((ref) => this.nodes[ref])
+      .filter((coords) => coords != null)
+      .map((coords) => geoPoint(coords));
+
+    return geoConcave(geoFeatureCollection(points));
   }
 
   hasSupportedStreetTags(tags) {
@@ -266,55 +501,95 @@ class Transformation {
     return null;
   }
 
-  // Flattens collection of ways per street by first sorting ways
-  // by looking at their distance to each other.
-  flattenStreetNodeGroups() {
-    Object.keys(this.streetToNodeGroups)
-      .forEach((street) => {
-        const sortedGroups = this.streetToNodeGroups[street].sort((a, b) => {
-          const aFirst = geoPoint(this.nodes[a[0]]);
-          const aLast = geoPoint(this.nodes[a[a.length - 1]]);
-          const bFirst = geoPoint(this.nodes[b[0]]);
-          const bLast = geoPoint(this.nodes[b[b.length - 1]]);
-          const abDistance = geoDistance(aLast, bFirst);
-          const baDistance = geoDistance(bLast, aFirst);
+  // Smallest polygon first, so a point inside nested boundaries gets the
+  // innermost one. Ties keep relation order.
+  sortRegionPolygons() {
+    this.regionPolygons.sort((a, b) => {
+      if (a.area !== b.area) {
+        return a.area - b.area;
+      }
 
-          if (abDistance < baDistance) {
-            return -1;
-          }
-          if (abDistance > baDistance) {
-            return 1;
-          }
-          return 0;
-        });
-
-        this.streetToNodes[street] = sortedGroups.flat();
-      });
+      return a.order - b.order;
+    });
   }
 
+  findRegion(coordinates) {
+    const point = geoPoint(coordinates);
+    const match = this.regionPolygons
+      .find((entry) => geoPointInPolygon(point, entry.polygon));
+
+    return match ? match.name : undefined;
+  }
+
+  // Each way belongs to the municipality its middle node (by index) lies in.
+  // A long way that crosses a boundary counts as a whole for that municipality;
+  // ways are not split by length or by majority of nodes.
+  assignWayGroupRegions() {
+    for (let i = 0; i < this.streetWayGroups.length; i++) {
+      const group = this.streetWayGroups[i];
+      const middleNode = group.refs[Math.floor(group.refs.length / 2)];
+
+      group.region = this.findRegion(this.nodes[middleNode]);
+    }
+  }
+
+  // Flattens a collection of ways by first sorting them
+  // by looking at their distance to each other.
+  flattenNodeGroups(nodeGroups) {
+    const sortedGroups = nodeGroups.slice().sort((a, b) => {
+      const aFirst = geoPoint(this.nodes[a[0]]);
+      const aLast = geoPoint(this.nodes[a[a.length - 1]]);
+      const bFirst = geoPoint(this.nodes[b[0]]);
+      const bLast = geoPoint(this.nodes[b[b.length - 1]]);
+      const abDistance = geoDistance(aLast, bFirst);
+      const baDistance = geoDistance(bLast, aFirst);
+
+      if (abDistance < baDistance) {
+        return -1;
+      }
+      if (abDistance > baDistance) {
+        return 1;
+      }
+      return 0;
+    });
+
+    return sortedGroups.flat();
+  }
+
+  // Builds one street per name and municipality: a name shared by several
+  // towns of the extract yields one street per town, each with its own
+  // centre and region.
   extractStreets() {
-    let i = 1;
+    const entities = new Map();
 
-    Object.keys(this.streetToNodes)
-      .sort(intlCompare)
-      .forEach((street) => {
-        const id = `s${i}`;
-        i += 1;
+    for (let i = 0; i < this.streetWayGroups.length; i++) {
+      const group = this.streetWayGroups[i];
+      const key = JSON.stringify([group.name, group.region || null]);
 
-        this.streetsToIds[street] = id;
-        this.idsToStreets[id] = street;
+      if (!entities.has(key)) {
+        entities.set(key, { name: group.name, region: group.region, groups: [] });
+      }
+      entities.get(key).groups.push(group);
+    }
 
-        const alternativeNames = this.streetAlternativeNames[street] || [];
-        const path = this.streetToNodes[street].map((nodeId) => this.nodes[nodeId]);
+    Array.from(entities.values())
+      .sort(compareStreetEntities)
+      .forEach((entity, index) => {
+        const id = `s${index + 1}`;
+        const { name, region, groups } = entity;
+        const alternativeNames = groups
+          .flatMap((group) => group.alternativeNames)
+          .filter((altName, position, names) => names.indexOf(altName) === position);
+        const nodeIds = this.flattenNodeGroups(groups.map((group) => group.refs));
+        const path = nodeIds.map((nodeId) => this.nodes[nodeId]);
         const coordinates = getCenterCoordsOfPath(path);
-        const centerPoint = geoPoint(coordinates);
-        const region = Object.keys(this.cityPolygons).find((name) => {
-          const polygon = this.cityPolygons[name];
-          return geoPointInPolygon(centerPoint, polygon);
-        });
+
+        for (let i = 0; i < groups.length; i++) {
+          groups[i].streetId = id;
+        }
 
         this.streets[id] = {
-          name: street,
+          name,
           alternativeNames,
           coordinates,
           region,
@@ -322,30 +597,37 @@ class Transformation {
       });
   }
 
+  // A junction is a node shared by the ways of two or more streets with
+  // different names. A street that keeps its name into the next municipality
+  // is one street continuing, not a corner.
   extractStreetJunctions() {
-    Object.keys(this.nodeToStreet)
+    Object.keys(this.nodeToWayGroups)
       .forEach((nodeId) => {
-        if (this.nodeToStreet[nodeId].length > 1) {
-          this.nodeToStreet[nodeId].forEach((street) => {
-            const streetId = this.streetsToIds[street];
+        const streetIds = this.nodeToWayGroups[nodeId]
+          .map((group) => group.streetId)
+          .filter((streetId, index, ids) => ids.indexOf(streetId) === index);
 
-            this.streetJunctions[streetId] = this.streetJunctions[streetId] || [];
+        if (streetIds.length > 1) {
+          streetIds.forEach((streetId) => {
+            const { name } = this.streets[streetId];
+            const existingStreetRefs = (this.streetJunctions[streetId] || [])
+              .map((entry) => entry.streetRef);
 
-            const existingStreetNames = this.streetJunctions[streetId]
-              .map((entry) => this.idsToStreets[entry.streetRef]);
-
-            const streetObjs = without(this.nodeToStreet[nodeId], street, ...existingStreetNames)
-              .map((junctionStreet) => ({
-                streetRef: this.streetsToIds[junctionStreet],
+            const streetObjs = without(streetIds, streetId, ...existingStreetRefs)
+              .filter((junctionStreetId) => this.streets[junctionStreetId].name !== name)
+              .map((junctionStreetId) => ({
+                streetRef: junctionStreetId,
                 coordinates: this.nodes[nodeId],
               }));
 
-            this.streetJunctions[streetId] = this.streetJunctions[streetId]
-              .concat(streetObjs)
-              .sort((a, b) => intlCompare(
-                this.idsToStreets[a.streetRef],
-                this.idsToStreets[b.streetRef],
-              ));
+            if (streetObjs.length > 0) {
+              this.streetJunctions[streetId] = (this.streetJunctions[streetId] || [])
+                .concat(streetObjs)
+                .sort((a, b) => compareStreetEntities(
+                  this.streets[a.streetRef],
+                  this.streets[b.streetRef],
+                ));
+            }
           });
         }
       });

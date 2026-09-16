@@ -104,6 +104,31 @@ docker run --volume /tmp:/data osm-search-data-export \
 * memory - Write data into a local variable
 * multi - Wraps multiple outputs
 
+## Street regions
+
+Every street carries a `region`: the name of the municipality it lies in, taken from the
+`admin_level=8` boundary relations (`type=boundary`, `boundary=administrative`, with a `name`)
+found in the input. The outer ways of each relation are stitched into rings by their endpoint
+nodes. Every highway way is then assigned the municipality its middle node (by index) falls in;
+when that node falls into several polygons the smallest one wins. A long way that crosses a
+boundary is not split: it counts as a whole for the municipality of its middle node.
+
+Streets are grouped by name **and** municipality, so a name that exists in several towns of the
+extract yields one street entry per town, each with its own centre, alternative names and
+junctions. A street that keeps its name across a municipal boundary is not listed as a corner
+of itself. Streets outside every municipality have no region (`null` in the compact output).
+Streets are sorted by name, then by region, with English collation (`Intl.Collator('en')`) so
+that the ids are the same on every machine.
+
+Municipalities at the edge of the extract are never complete: Overpass (`(node;<;)`) and
+`osmium extract` return only the boundary ways that have nodes inside the bounding box and do
+not complete relations, so an open chain of outer ways is the normal case there. Such a chain
+is closed with a straight segment from its last to its first node. When that segment would
+cross the chain (a self-intersecting ring, whose parts the even-odd test would flip), the
+concave hull of the chain's nodes is used instead. Either way the polygon is only approximate
+where the boundary was clipped. A relation whose outer ways yield no polygon at all falls back
+to the concave hull of all their nodes.
+
 ## Config
 
 Please consult `src/config.js` for a list of whitelisted types that will be included in the resulting file. See Usage on information on how to override these values.
