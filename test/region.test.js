@@ -40,25 +40,25 @@ class Dataset {
   }
 
   // A residential street over existing nodes.
-  streetWay(name, refs) {
-    return this.way(refs, { name, highway: 'residential' });
+  streetWay(name, refs, tags = {}) {
+    return this.way(refs, { name, highway: 'residential', ...tags });
   }
 
   // A residential street between two coordinates.
-  street(name, [lon1, lat1], [lon2, lat2]) {
-    return this.streetWay(name, [this.node(lon1, lat1), this.node(lon2, lat2)]);
+  street(name, [lon1, lat1], [lon2, lat2], tags = {}) {
+    return this.streetWay(name, [this.node(lon1, lat1), this.node(lon2, lat2)], tags);
   }
 
   // Municipality boundary relation. `memberKey` selects the member id field:
   // 'ref' as in Overpass JSON, 'id' as emitted by osm-pbf-parser.
-  municipality(name, outerWayIds, { memberKey = 'ref', innerWayIds = [] } = {}) {
+  municipality(name, outerWayIds, { memberKey = 'ref', innerWayIds = [], tags = {} } = {}) {
     const member = (role) => (wayId) => ({ type: 'way', role, [memberKey]: wayId });
 
     this.relations.push({
       type: 'relation',
       id: this.nextId(),
       tags: {
-        type: 'boundary', boundary: 'administrative', admin_level: '8', name,
+        type: 'boundary', boundary: 'administrative', admin_level: '8', name, ...tags,
       },
       members: outerWayIds.map(member('outer')).concat(innerWayIds.map(member('inner'))),
     });
@@ -243,6 +243,47 @@ describe('streets split by municipality', () => {
     assertNear(streetJunctions.s4[0].coordinates, [0.5, 0.5]);
   });
 
+  it('does not list a street continuing into the next municipality as a corner', () => {
+    const ds = new Dataset();
+    const [a1, a2, a3, a4] = ds.corners(square(0, 0, 1));
+    const [b1, b2, b3, b4] = ds.corners(square(1, 0, 1));
+    ds.municipality('A', [ds.way([a1, a2, a3, a4, a1])]);
+    ds.municipality('B', [ds.way([b1, b2, b3, b4, b1])]);
+    // "Calle Sucre" runs from A into B through the node on the seam.
+    const seam = ds.node(1, 0.5);
+    const crossA = ds.node(0.5, 0.5);
+    ds.streetWay('Calle Sucre', [ds.node(0.2, 0.5), crossA, seam]);
+    ds.streetWay('Calle Sucre', [seam, ds.node(1.8, 0.5)]);
+    ds.streetWay('Calle Norte', [ds.node(0.5, 0.2), crossA, ds.node(0.5, 0.8)]);
+
+    const { streets, streetJunctions } = ds.run();
+    const refs = (id) => (streetJunctions[id] || []).map((junction) => junction.streetRef);
+
+    assert.deepEqual(Object.values(streets).map((street) => [street.name, street.region]), [
+      ['Calle Norte', 'A'], ['Calle Sucre', 'A'], ['Calle Sucre', 'B'],
+    ]);
+    assert.deepEqual(refs('s1'), ['s2']);
+    assert.deepEqual(refs('s2'), ['s1']);
+    assert.deepEqual(refs('s3'), []);
+    assert.equal(streetJunctions.s3, undefined);
+  });
+
+  it('keeps the alternative names of each street separately', () => {
+    const ds = new Dataset();
+    const [a1, a2, a3, a4] = ds.corners(square(0, 0, 1));
+    const [b1, b2, b3, b4] = ds.corners(square(1, 0, 1));
+    ds.municipality('A', [ds.way([a1, a2, a3, a4, a1])]);
+    ds.municipality('B', [ds.way([b1, b2, b3, b4, b1])]);
+    ds.street('Calle Sucre', [0.2, 0.5], [0.4, 0.5], { alt_name: 'Sucre de A' });
+    ds.street('Calle Sucre', [0.6, 0.5], [0.8, 0.5]);
+    ds.street('Calle Sucre', [1.2, 0.5], [1.8, 0.5], { alt_name: 'Sucre de B;Sucre B' });
+
+    const { streets } = ds.run();
+
+    assert.deepEqual(streets.s1.alternativeNames, ['Sucre de A']);
+    assert.deepEqual(streets.s2.alternativeNames, ['Sucre de B', 'Sucre B']);
+  });
+
   it('merges the ways of one street inside one municipality', () => {
     const ds = new Dataset();
     const [c1, c2, c3, c4] = ds.corners(square(0, 0, 1));
@@ -257,5 +298,69 @@ describe('streets split by municipality', () => {
     assert.equal(streets.s1.region, 'M');
     assertNear(streets.s1.coordinates, [0.5, 0.5]);
     assert.deepEqual(streetJunctions, {});
+  });
+});
+
+describe('boundary and way edge cases', () => {
+  it('uses the concave hull of a chain whose straight closure crosses it', () => {
+    const ds = new Dataset();
+    // Hook-shaped chain: the closing segment (3,1) -> (0,0) crosses the side x=2.
+    const hook = ds.corners([[0, 0], [2, 0], [2, 2], [0, 2], [0, 1], [3, 1]]);
+    ds.municipality('Hook', [ds.way(hook)]);
+    ds.street('Inside', [0.4, 0.5], [0.6, 0.5]);
+
+    assert.equal(ds.regions().Inside, 'Hook');
+  });
+
+  it('keeps the straight closure of a chain when it does not cross it', () => {
+    const ds = new Dataset();
+    // L-shaped chain missing the edge (0,3) -> (0,0); its hull would cover the notch.
+    const l = ds.corners([[0, 0], [3, 0], [3, 1], [1, 1], [1, 3], [0, 3]]);
+    ds.municipality('L', [ds.way(l)]);
+    ds.street('In the arm', [0.2, 2], [0.8, 2]);
+    ds.street('In the notch', [1.8, 2], [2.2, 2]);
+
+    assert.deepEqual(ds.regions(), { 'In the arm': 'L', 'In the notch': undefined });
+  });
+
+  it('ignores an outer way listed twice in the relation', () => {
+    const ds = new Dataset();
+    const [c1, c2, c3, c4] = ds.corners(square(0, 0, 1));
+    const half1 = ds.way([c1, c2, c3]);
+    const half2 = ds.way([c3, c4, c1]);
+    ds.municipality('M', [half1, half1, half2]);
+    ds.street('Inside', [0.2, 0.5], [0.8, 0.5]);
+
+    assert.equal(ds.regions().Inside, 'M');
+  });
+
+  it('skips a boundary relation without a name', () => {
+    const ds = new Dataset();
+    const [o1, o2, o3, o4] = ds.corners(square(0, 0, 4));
+    const [u1, u2, u3, u4] = ds.corners(square(1, 1, 1));
+    ds.municipality('Named', [ds.way([o1, o2, o3, o4, o1])]);
+    ds.municipality(undefined, [ds.way([u1, u2, u3, u4, u1])]);
+    ds.street('Inside the unnamed one', [1.2, 1.5], [1.8, 1.5]);
+
+    assert.equal(ds.regions()['Inside the unnamed one'], 'Named');
+  });
+
+  it('accepts admin_level given as a number', () => {
+    const ds = new Dataset();
+    const [c1, c2, c3, c4] = ds.corners(square(0, 0, 1));
+    ds.municipality('M', [ds.way([c1, c2, c3, c4, c1])], { tags: { admin_level: 8 } });
+    ds.street('Inside', [0.2, 0.5], [0.8, 0.5]);
+
+    assert.equal(ds.regions().Inside, 'M');
+  });
+
+  it('ignores a street way with a single node', () => {
+    const ds = new Dataset();
+    const [c1, c2, c3, c4] = ds.corners(square(0, 0, 1));
+    ds.municipality('M', [ds.way([c1, c2, c3, c4, c1])]);
+    ds.streetWay('Lonely', [ds.node(0.5, 0.5)]);
+    ds.street('Street', [0.2, 0.5], [0.8, 0.5]);
+
+    assert.deepEqual(ds.regions(), { Street: 'M' });
   });
 });
